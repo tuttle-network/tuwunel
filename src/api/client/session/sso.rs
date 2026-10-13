@@ -63,6 +63,10 @@ struct GrantQuery<'a> {
 	redirect_uri: Option<&'a str>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	prompt: Option<&'a str>,
+	/// OIDC login_hint from the Matrix MXID localpart when the caller is
+	/// already known (account management, authenticated SSO, login token).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	login_hint: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -74,6 +78,8 @@ struct GrantCookie<'a> {
 }
 
 static GRANT_SESSION_COOKIE: &str = "tuwunel_grant_session";
+/// Short-lived hint set by /_tuwunel/oidc/account when a loginToken is present.
+pub(crate) static LOGIN_HINT_COOKIE: &str = "tuwunel_login_hint";
 
 /// Path attribute for the grant-session cookie. The set and removal cookies
 /// must use the same value: a cookie is only replaced (and thus removed) when
@@ -171,12 +177,21 @@ pub(crate) async fn sso_login_route(
 		.get_default_id()
 		.unwrap_or_default();
 
-	handle_sso_login(&services, &client, default_idp_id, redirect_url, None, action)
-		.map_ok(|response| sso_login::v3::Response {
-			location: response.location,
-			cookie: response.cookie,
-		})
-		.await
+	handle_sso_login(
+		&services,
+		&client,
+		default_idp_id,
+		redirect_url,
+		None,
+		body.sender_user.clone(),
+		hint_from_cookie(&body.cookie),
+		action,
+	)
+	.map_ok(|response| sso_login::v3::Response {
+		location: response.location,
+		cookie: response.cookie,
+	})
+	.await
 }
 
 /// # `GET /_matrix/client/v3/login/sso/redirect/{idpId}`
@@ -204,7 +219,24 @@ pub(crate) async fn sso_login_with_provider_route(
 	let login_token = body.body.login_token;
 	let action = body.body.action;
 
-	handle_sso_login(&services, &client, idp_id, redirect_url, login_token, action).await
+	handle_sso_login(
+		&services,
+		&client,
+		idp_id,
+		redirect_url,
+		login_token,
+		body.sender_user.clone(),
+		hint_from_cookie(&body.cookie),
+		action,
+	)
+	.await
+}
+
+fn hint_from_cookie(jar: &CookieJar) -> Option<String> {
+	jar.get(LOGIN_HINT_COOKIE)
+		.map(|c| c.value())
+		.filter(|v| !v.is_empty())
+		.map(str::to_owned)
 }
 
 async fn handle_sso_login(
@@ -213,6 +245,8 @@ async fn handle_sso_login(
 	idp_id: String,
 	redirect_url: String,
 	login_token: Option<String>,
+	sender_user: Option<OwnedUserId>,
+	cookie_hint: Option<String>,
 	action: Option<SsoRedirectAction>,
 ) -> Result<sso_login_with_provider::v3::Response> {
 	let redirect_url: Url = redirect_url.parse().map_err(|e| {
@@ -235,6 +269,17 @@ async fn handle_sso_login(
 		.filter(|_| provider.forward_action_prompt)
 		.and_then(|action| matches!(action, SsoRedirectAction::Register).then_some("create"));
 
+	let peeked = login_token
+		.as_deref()
+		.map_async(|token| services.users.peek_login_token(token))
+		.map(FlatOk::flat_ok)
+		.await;
+	let login_hint = peeked
+		.as_ref()
+		.or(sender_user.as_ref())
+		.map(|u| u.localpart().to_owned())
+		.or(cookie_hint);
+
 	let query = GrantQuery {
 		client_id: &provider.client_id,
 		state: &sess_id,
@@ -245,6 +290,7 @@ async fn handle_sso_login(
 		code_challenge: &code_challenge,
 		redirect_uri: callback_uri,
 		prompt,
+		login_hint: login_hint.as_deref(),
 		scope: scope
 			.is_empty()
 			.then_some("openid email profile")
@@ -452,10 +498,11 @@ pub(crate) async fn sso_callback_route(
 				| true => "sso",
 				// Present in LDAP is an existing user to provision, not a new registration.
 				| false if ldap_user_exists(&services, &user_id).await => "ldap",
-				| false =>
+				| false => {
 					return Err!(Request(Forbidden(
 						"Registration from this provider is disabled"
-					))),
+					)));
+				},
 			};
 
 			register_user(&services, &provider, &session, &userinfo, &user_id, origin).await?;
