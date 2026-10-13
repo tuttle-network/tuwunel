@@ -29,8 +29,8 @@ pub(crate) use self::{
 	logout::{logout_all_route, logout_route},
 	refresh::refresh_token_route,
 	sso::{
-		sso_callback_route, sso_complete_js_route, sso_css_route, sso_fallback_route,
-		sso_login_route, sso_login_with_provider_route,
+		LOGIN_HINT_COOKIE, sso_callback_route, sso_complete_js_route, sso_css_route,
+		sso_fallback_route, sso_login_route, sso_login_with_provider_route,
 	},
 	token::login_token_route,
 };
@@ -126,13 +126,16 @@ pub(crate) async fn login_route(
 	body: Ruma<login::v3::Request>,
 ) -> Result<login::v3::Response> {
 	let user_id = match &body.login_info {
-		| LoginInfo::Password(info) if services.config.login_with_password =>
-			password::handle_login(&services, &body, info).await?,
+		| LoginInfo::Password(info) if services.config.login_with_password => {
+			password::handle_login(&services, &body, info).await?
+		},
 		| LoginInfo::Token(info) => token::handle_login(&services, &body, info).await?,
-		| LoginInfo::Jwt(info) if services.config.jwt.enable =>
-			jwt::handle_login(&services, &body, info).await?,
-		| LoginInfo::ApplicationService(info) =>
-			appservice::handle_login(&services, &body, info)?,
+		| LoginInfo::Jwt(info) if services.config.jwt.enable => {
+			jwt::handle_login(&services, &body, info).await?
+		},
+		| LoginInfo::ApplicationService(info) => {
+			appservice::handle_login(&services, &body, info)?
+		},
 		| _ => {
 			return Err!(Request(Unknown(debug_warn!("Invalid or unsupported login type"))));
 		},

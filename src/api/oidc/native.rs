@@ -185,7 +185,7 @@ async fn native_submit(
 
 	let redirect = complete_redirect(services, context, &token)?;
 
-	Ok(account_redirect_response(redirect))
+	Ok(account_redirect_response(redirect, None))
 }
 
 /// Authenticate a local account by password, mirroring the `/login` password

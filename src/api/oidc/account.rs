@@ -14,9 +14,10 @@ use axum::{
 	extract::{Form, Request, State},
 	response::{Html, IntoResponse, Redirect, Response},
 };
+use axum_extra::extract::cookie::{Cookie, SameSite};
 use http::{
 	HeaderValue, Method, StatusCode,
-	header::{CACHE_CONTROL, CONTENT_TYPE, REFERRER_POLICY},
+	header::{CACHE_CONTROL, CONTENT_TYPE, REFERRER_POLICY, SET_COOKIE},
 };
 use ruma::OwnedDeviceId;
 use tuwunel_core::{
@@ -40,6 +41,7 @@ use super::{
 	authorize::should_serve_native, consume_login_token, peek_login_token, sso_redirect_url,
 	url_encode,
 };
+use crate::client::session::LOGIN_HINT_COOKIE;
 
 pub(crate) static ACCOUNT_MANAGEMENT_ACTIONS_SUPPORTED: &[&str] = &[
 	"org.matrix.profile",
@@ -76,6 +78,8 @@ static ACCOUNT_CACHE_CONTROL: &str = "no-store";
 struct AccountQueryParams {
 	action: Option<String>,
 	device_id: Option<String>,
+	#[serde(rename = "loginToken")]
+	login_token: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -104,13 +108,26 @@ pub(crate) async fn get_account_route(
 
 	let device_id = params.device_id.as_deref().unwrap_or_default();
 
-	match account_auth_redirect(&services, action, device_id) {
+	let login_hint = match params.login_token.as_deref() {
+		| Some(token) => peek_login_token(&services, Some(token))
+			.await
+			.ok()
+			.map(|u| u.localpart().to_owned()),
+		| None => None,
+	};
+
+	match account_auth_redirect(&services, action, device_id, login_hint.as_deref()) {
 		| Ok(response) => response,
 		| Err(e) => account_error_response(&e),
 	}
 }
 
-fn account_auth_redirect(services: &Services, action: &str, device_id: &str) -> Result<Response> {
+fn account_auth_redirect(
+	services: &Services,
+	action: &str,
+	device_id: &str,
+	login_hint: Option<&str>,
+) -> Result<Response> {
 	validate_account_action(action)?;
 
 	let idp_id = services.oauth.providers.get_default_id();
@@ -120,7 +137,9 @@ fn account_auth_redirect(services: &Services, action: &str, device_id: &str) -> 
 
 	match serve_native {
 		| true => account_native_redirect(services, action, device_id),
-		| false => account_sso_redirect(services, action, device_id, idp_id.as_deref()),
+		| false => {
+			account_sso_redirect(services, action, device_id, idp_id.as_deref(), login_hint)
+		},
 	}
 }
 
@@ -132,13 +151,13 @@ fn account_native_redirect(
 	let issuer = services.oauth.get_server()?.issuer_url()?;
 	let base = issuer.trim_end_matches('/');
 
-	let native_url = Url::parse_with_params(&format!("{base}/_tuwunel/oidc/native"), [
-		("action", action),
-		("device_id", device_id),
-	])
+	let native_url = Url::parse_with_params(
+		&format!("{base}/_tuwunel/oidc/native"),
+		[("action", action), ("device_id", device_id)],
+	)
 	.map_err(|_| err!(Request(InvalidParam("Failed to build native login URL"))))?;
 
-	Ok(account_redirect_response(Redirect::temporary(native_url.as_str())))
+	Ok(account_redirect_response(Redirect::temporary(native_url.as_str()), None))
 }
 
 fn account_sso_redirect(
@@ -146,6 +165,7 @@ fn account_sso_redirect(
 	action: &str,
 	device_id: &str,
 	idp_id: Option<&str>,
+	login_hint: Option<&str>,
 ) -> Result<Response> {
 	let idp_id = idp_id
 		.ok_or_else(|| err!(Config("identity_provider", "No identity provider configured")))?;
@@ -153,16 +173,15 @@ fn account_sso_redirect(
 	let issuer = services.oauth.get_server()?.issuer_url()?;
 	let base = issuer.trim_end_matches('/');
 
-	let callback_url =
-		Url::parse_with_params(&format!("{base}/_tuwunel/oidc/account_callback"), [
-			("action", action),
-			("device_id", device_id),
-		])
-		.map_err(|_| err!(error!("Failed to build account callback URL")))?;
+	let callback_url = Url::parse_with_params(
+		&format!("{base}/_tuwunel/oidc/account_callback"),
+		[("action", action), ("device_id", device_id)],
+	)
+	.map_err(|_| err!(error!("Failed to build account callback URL")))?;
 
 	let sso_url = sso_redirect_url(base, idp_id, &callback_url)?;
 
-	Ok(account_redirect_response(Redirect::temporary(sso_url.as_str())))
+	Ok(account_redirect_response(Redirect::temporary(sso_url.as_str()), login_hint))
 }
 
 pub(crate) async fn get_account_callback_route(
@@ -259,19 +278,22 @@ async fn handle_account_callback(
 		| "org.matrix.sessions_list" => consume_login_token(services, login_token).await?,
 		| _ if method == Method::POST => consume_login_token(services, login_token).await?,
 		| _ if method == Method::GET => peek_login_token(services, login_token).await?,
-		| _ =>
+		| _ => {
 			return Err!(HttpJson(METHOD_NOT_ALLOWED, {
 				"errcode": "M_UNRECOGNIZED",
 				"error": "Unsupported account management method",
-			})),
+			}));
+		},
 	};
 
 	match action {
-		| "org.matrix.sessions_list" if method == Method::GET =>
-			sessions_list_html(services, &user_id).await,
+		| "org.matrix.sessions_list" if method == Method::GET => {
+			sessions_list_html(services, &user_id).await
+		},
 
-		| "org.matrix.profile" if method == Method::GET =>
-			profile_html(services, &user_id, login_token.unwrap_or_default()).await,
+		| "org.matrix.profile" if method == Method::GET => {
+			profile_html(services, &user_id, login_token.unwrap_or_default()).await
+		},
 
 		| "org.matrix.profile" if method == Method::POST => {
 			// Sanitize: strip control chars, limit to 255 Unicode code points.
@@ -297,22 +319,24 @@ async fn handle_account_callback(
 
 			profile_saved_html(&user_id, displayname).await
 		},
-		| "org.matrix.session_view" if method == Method::GET =>
+		| "org.matrix.session_view" if method == Method::GET => {
 			session_view_html(
 				services,
 				&user_id,
 				params.device_id.as_deref().unwrap_or_default(),
 				login_token.unwrap_or_default(),
 			)
-			.await,
+			.await
+		},
 
-		| "org.matrix.session_end" if method == Method::POST =>
+		| "org.matrix.session_end" if method == Method::POST => {
 			session_end_execute_html(
 				services,
 				&user_id,
 				params.device_id.as_deref().unwrap_or_default(),
 			)
-			.await,
+			.await
+		},
 
 		| "org.matrix.session_end" if method == Method::GET => {
 			// Authenticate first (peek), then show a POST confirmation form.
@@ -338,23 +362,30 @@ async fn handle_account_callback(
 			)
 			.await
 		},
-		| "org.matrix.account_deactivate" if method == Method::POST =>
-			account_deactivate_execute_html(services, &user_id).await,
+		| "org.matrix.account_deactivate" if method == Method::POST => {
+			account_deactivate_execute_html(services, &user_id).await
+		},
 
-		| "org.matrix.account_deactivate" if method == Method::GET =>
-			account_deactivate_confirm_html(&user_id, login_token.unwrap_or_default()).await,
+		| "org.matrix.account_deactivate" if method == Method::GET => {
+			account_deactivate_confirm_html(&user_id, login_token.unwrap_or_default()).await
+		},
 
-		| "org.matrix.cross_signing_reset" if method == Method::POST =>
-			cross_signing_reset_execute_html(services, &user_id).await,
+		| "org.matrix.cross_signing_reset" if method == Method::POST => {
+			cross_signing_reset_execute_html(services, &user_id).await
+		},
 
-		| "org.matrix.cross_signing_reset" if method == Method::GET =>
-			cross_signing_reset_confirm_html(&user_id, login_token.unwrap_or_default()).await,
+		| "org.matrix.cross_signing_reset" if method == Method::GET => {
+			cross_signing_reset_confirm_html(&user_id, login_token.unwrap_or_default()).await
+		},
 
 		| _ => Err!(Request(InvalidParam("Unsupported account management action"))),
 	}
 }
 
-pub(super) fn account_redirect_response(redirect: Redirect) -> Response {
+pub(super) fn account_redirect_response(
+	redirect: Redirect,
+	login_hint: Option<&str>,
+) -> Response {
 	let mut response = redirect.into_response();
 
 	response
@@ -364,6 +395,22 @@ pub(super) fn account_redirect_response(redirect: Redirect) -> Response {
 	response
 		.headers_mut()
 		.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+
+	if let Some(hint) = login_hint.filter(|h| !h.is_empty()) {
+		let max_age = std::time::Duration::from_secs(120)
+			.try_into()
+			.expect("std::time::Duration to time::Duration");
+		let cookie = Cookie::build((LOGIN_HINT_COOKIE, hint))
+			.path("/_matrix/client/v3/login/sso")
+			.max_age(max_age)
+			.same_site(SameSite::Lax)
+			.secure(true)
+			.http_only(true)
+			.build();
+		if let Ok(value) = HeaderValue::from_str(&cookie.to_string()) {
+			response.headers_mut().append(SET_COOKIE, value);
+		}
+	}
 
 	response
 }

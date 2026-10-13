@@ -4107,6 +4107,11 @@
 # extra_authorization_parameters = { prompt = "login" }
 # ```
 #
+# When the Matrix user is already known (account management loginToken,
+# authenticated SSO, or a short-lived hint cookie), Tuwunel also sends
+# OIDC `login_hint` set to the MXID localpart so the IdP can select the
+# matching session instead of the last browser cookie.
+#
 #extra_authorization_parameters = {}
 
 # Forward the MSC3824 `action` query parameter from the SSO redirect
