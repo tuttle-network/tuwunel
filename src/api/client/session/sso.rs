@@ -813,12 +813,12 @@ async fn decide_user_id(
 		userinfo
 			.preferred_username
 			.as_deref()
-			.map(str::to_lowercase)
+			.map(localpart_from_idp_username)
 			.filter(|_| allowed("preferred_username")),
 		userinfo
 			.username
 			.as_deref()
-			.map(str::to_lowercase)
+			.map(localpart_from_idp_username)
 			.filter(|_| allowed("username")),
 		userinfo
 			.nickname
@@ -915,6 +915,18 @@ async fn try_user_id(
 	Some(user_id)
 }
 
+/// Matrix localparts cannot contain `@`. Some identity providers put an
+/// email address in `preferred_username`. Keep the mailbox name so the MXID
+/// localpart stays valid.
+fn localpart_from_idp_username(username: &str) -> String {
+	let s = username.trim();
+	let s = s.strip_prefix('@').unwrap_or(s);
+	s.split_once('@')
+		.map(|(local, _)| local)
+		.unwrap_or(s)
+		.to_lowercase()
+}
+
 fn parse_user_id(server_name: &ServerName, username: &str) -> Result<OwnedUserId> {
 	match UserId::parse_with_server_name(username, server_name) {
 		| Err(e) => {
@@ -1002,6 +1014,14 @@ mod tests {
 
 		let message = format!("{error}");
 		assert!(message.contains("invalid base64"), "unexpected error: {message}");
+	}
+
+	#[test]
+	fn localpart_from_idp_username_strips_email_shaped_identity() {
+		assert_eq!(localpart_from_idp_username("ada@example.com"), "ada");
+		assert_eq!(localpart_from_idp_username("Ada@example.com"), "ada");
+		assert_eq!(localpart_from_idp_username(" ada@example.com "), "ada");
+		assert_eq!(localpart_from_idp_username("ada"), "ada");
 	}
 
 	#[test]
